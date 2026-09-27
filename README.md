@@ -17,7 +17,7 @@ Why it exists: DSH runs background work (a `run_in_background` shell call, a bac
 - **Just finished**: `✓ 1` — accent outline, a pulse, a two-note chime (rising for success, falling for failures), and a `(1) ` prefix on the window title so a background taskbar still tells you.
 - **Clicking is looking**: the panel opens and the unread count clears. The count lives in the Host, so two open windows cannot disagree about it.
 - **Minimized**: the in-page chip is invisible by definition, so a completion also plays the chime and sets the taskbar badge (`navigator.setAppBadge`).
-- **Foreground commands never light it.** Only real background jobs do; a foreground shell call removes its own record when it settles.
+- **Foreground commands never light it.** A foreground shell call waits on its own job (`registry.wait(id, …)`) and removes the record right after, so its settlement arrives with `awaited: true` and its result is surfacing in the conversation at that moment. The registry publishes that flag for exactly this purpose — *"so a completion reporter can skip settlements a waiting caller already collected"* — and honouring it is what stopped **every tool call from chiming once**. A background job has no waiter, arrives with `awaited: false`, and does light the badge. Tested in both directions.
 
 ## How it works
 
@@ -84,7 +84,7 @@ Config changes hot-apply: the Host re-applies the entry and the page picks up th
 ## Verify
 
 ```powershell
-node test/tracker-test.mjs     # Host half: 109 assertions (pure tracker + routes/subscription/
+node test/tracker-test.mjs     # Host half: 117 assertions (pure tracker + routes/subscription/
                                # injection/cleanup against a fake Host)
 node test/notice-render.mjs    # real browser (headless Edge + CDP): 50 assertions over the live DOM
 node test/verify-live.mjs      # against the running Host: copies in sync? which generation answers?

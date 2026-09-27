@@ -128,7 +128,7 @@ export function createTracker(options = {}) {
     return changed;
   }
 
-  function settle(view, cause) {
+  function settle(view, cause, awaited) {
     const row = project(view, { finishedAt: finite(view.finishedAt, now()) });
     if (cause !== undefined) row.cause = cause;
     else if (view.cause !== undefined) row.cause = view.cause;
@@ -137,10 +137,20 @@ export function createTracker(options = {}) {
     done.unshift(row);
     live.delete(row.id);
     /*
-     * A `teardown` settlement means the owner is being destroyed and no reader is left. It is
-     * history worth listing, but nothing a person can act on, so it never lights the badge.
+     * WHO IS THIS NEWS FOR?
+     *
+     * `awaited` is the registry telling us that a caller was inside `jobs.wait()` when this settled
+     * - in practice the FOREGROUND shell tool, which waits on its own process and then removes the
+     * record. That result is surfacing in the conversation at this very moment, with a human looking
+     * at it; counting it as unread is what made every tool call chime once. The registry publishes
+     * the flag for exactly this purpose ("so a completion reporter can skip settlements a waiting
+     * caller already collected"), so this is the rule, not a heuristic.
+     *
+     * A real background job has no waiter - the spawning tool returned immediately - so it arrives
+     * with `awaited: false` and does light the badge. A `teardown` settlement has no reader left at
+     * all: history, never a notification.
      */
-    if (row.cause !== 'teardown') unseen.add(row.id);
+    if (row.cause !== 'teardown' && awaited !== true) unseen.add(row.id);
     prune();
     revision++;
     return true;
@@ -157,7 +167,7 @@ export function createTracker(options = {}) {
       if (!view || view.id === undefined || view.id === null) return false;
       const id = String(view.id);
 
-      if (type === 'settled') return settle(view, event.cause);
+      if (type === 'settled') return settle(view, event.cause, event.awaited === true);
 
       if (type === 'registered' || type === 'progress' || type === 'stopping') {
         /* defensive: a lifecycle event that already carries a terminal status is a settlement */

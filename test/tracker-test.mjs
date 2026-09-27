@@ -79,6 +79,35 @@ const view = (id, over) => Object.assign({
 }
 
 {
+  /*
+   * THE FALSE CHIME THAT STARTED THIS RULE. A foreground shell tool waits on its own job
+   * (`registry.wait`) and removes the record right after, so the feed delivers
+   * settled(awaited:true) + removed back to back. Counting the first as unread made the badge
+   * chime once per tool call - the symptom a person actually hears.
+   */
+  const t = createTracker({ now: () => 5000 });
+  t.ingest({ type: 'registered', job: view('fg-1') });
+  check('a waited settlement is still ingested',
+    t.ingest({ type: 'settled', cause: 'producer', awaited: true, job: view('fg-1', { status: 'completed', finishedAt: 4000 }) }), true);
+  check('a waited settlement is history, not news', t.snapshot({}).unseen, 0);
+  check('it is still listed while it lasts', t.snapshot({}).counts.settled, 1);
+  check('the removal that follows leaves nothing behind',
+    t.ingest({ type: 'removed', job: view('fg-1', { status: 'completed' }) }), true);
+  check('and the badge never moved', t.snapshot({}).unseen, 0);
+
+  /* the other side of the same rule: nobody was waiting -> it is news */
+  const bg = createTracker({ now: () => 5000 });
+  check('an unwatched settlement lights the badge',
+    bg.ingest({ type: 'settled', cause: 'producer', awaited: false, job: view('bg-1', { status: 'completed', finishedAt: 4000 }) }), true);
+  check('unwatched -> unread', bg.snapshot({}).unseen, 1);
+
+  /* a feed that omits the flag entirely must not silence real completions */
+  const legacy = createTracker({ now: () => 5000 });
+  legacy.ingest({ type: 'settled', cause: 'producer', job: view('bg-2', { status: 'completed', finishedAt: 4000 }) });
+  check('a missing awaited flag still counts as news', legacy.snapshot({}).unseen, 1);
+}
+
+{
   /* stopping is still running work */
   const t = createTracker({ now: () => 0 });
   t.ingest({ type: 'registered', job: view('bash-2') });
