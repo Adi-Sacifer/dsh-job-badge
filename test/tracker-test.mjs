@@ -15,6 +15,9 @@
  */
 import { apply, createTracker } from '../index.js';
 
+/** The grace period is a real duration, so one case waits on the real clock instead of faking it. */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 let pass = 0;
 const failures = [];
 const check = (label, actual, expected) => {
@@ -32,7 +35,7 @@ const view = (id, over) => Object.assign({
 /* ------------------------------------------------------------------ tracker */
 
 {
-  const t = createTracker({ now: () => 5000 });
+  const t = createTracker({ graceMs: 0, now: () => 5000 });
 
   check('registered: one running row', t.ingest({ type: 'registered', job: view('bash-1') }), true);
   let s = t.snapshot({});
@@ -69,7 +72,7 @@ const view = (id, over) => Object.assign({
 
 {
   /* a teardown settlement is history, not news */
-  const t = createTracker({ now: () => 9000 });
+  const t = createTracker({ graceMs: 0, now: () => 9000 });
   t.ingest({ type: 'registered', job: view('bash-9') });
   t.ingest({ type: 'settled', cause: 'teardown', job: view('bash-9', { status: 'killed', finishedAt: 8000 }) });
   const s = t.snapshot({});
@@ -85,7 +88,7 @@ const view = (id, over) => Object.assign({
    * settled(awaited:true) + removed back to back. Counting the first as unread made the badge
    * chime once per tool call - the symptom a person actually hears.
    */
-  const t = createTracker({ now: () => 5000 });
+  const t = createTracker({ graceMs: 0, now: () => 5000 });
   t.ingest({ type: 'registered', job: view('fg-1') });
   check('a waited settlement is still ingested',
     t.ingest({ type: 'settled', cause: 'producer', awaited: true, job: view('fg-1', { status: 'completed', finishedAt: 4000 }) }), true);
@@ -96,20 +99,20 @@ const view = (id, over) => Object.assign({
   check('and the badge never moved', t.snapshot({}).unseen, 0);
 
   /* the other side of the same rule: nobody was waiting -> it is news */
-  const bg = createTracker({ now: () => 5000 });
+  const bg = createTracker({ graceMs: 0, now: () => 5000 });
   check('an unwatched settlement lights the badge',
     bg.ingest({ type: 'settled', cause: 'producer', awaited: false, job: view('bg-1', { status: 'completed', finishedAt: 4000 }) }), true);
   check('unwatched -> unread', bg.snapshot({}).unseen, 1);
 
   /* a feed that omits the flag entirely must not silence real completions */
-  const legacy = createTracker({ now: () => 5000 });
+  const legacy = createTracker({ graceMs: 0, now: () => 5000 });
   legacy.ingest({ type: 'settled', cause: 'producer', job: view('bg-2', { status: 'completed', finishedAt: 4000 }) });
   check('a missing awaited flag still counts as news', legacy.snapshot({}).unseen, 1);
 }
 
 {
   /* stopping is still running work */
-  const t = createTracker({ now: () => 0 });
+  const t = createTracker({ graceMs: 0, now: () => 0 });
   t.ingest({ type: 'registered', job: view('bash-2') });
   t.ingest({ type: 'stopping', job: view('bash-2', { status: 'stopping' }) });
   check('stopping still counts as running', t.snapshot({}).counts.running, 1);
@@ -118,7 +121,7 @@ const view = (id, over) => Object.assign({
 
 {
   /* removal takes the id out of every list at once */
-  const t = createTracker({ now: () => 0 });
+  const t = createTracker({ graceMs: 0, now: () => 0 });
   t.ingest({ type: 'registered', job: view('bash-3') });
   t.ingest({ type: 'settled', job: view('bash-3', { status: 'completed', finishedAt: 10 }) });
   check('removed is a change', t.ingest({ type: 'removed', job: view('bash-3', { status: 'completed' }) }), true);
@@ -130,7 +133,7 @@ const view = (id, over) => Object.assign({
 
 {
   /* a terminal status arriving on a lifecycle event is still a settlement */
-  const t = createTracker({ now: () => 0 });
+  const t = createTracker({ graceMs: 0, now: () => 0 });
   t.ingest({ type: 'registered', job: view('bash-4', { status: 'completed', finishedAt: 3 }) });
   const s = t.snapshot({});
   check('terminal-on-registered lands in settled', s.counts.settled, 1);
@@ -138,8 +141,83 @@ const view = (id, over) => Object.assign({
 }
 
 {
+  /*
+   * THE GRACE PERIOD. The registry publishes no foreground/background flag at registration, so a
+   * job that is over in a moment (a tool call) and one that will run for ten minutes (real
+   * background work) look identical at birth. Waiting briefly is the only separator available.
+   */
+  let clock = 1000;
+  const t = createTracker({ now: () => clock, graceMs: 2000 });
+  check('a registration is held, not shown', t.ingest({ type: 'registered', job: view('held') }), false);
+  check('nothing is counted as running yet', t.snapshot({}).counts.running, 0);
+  check('it is waiting', t.hasPending(), true);
+  check('a second identical registration is not a change', t.ingest({ type: 'registered', job: view('held') }), false);
+  check('nothing promotes early', t.promoteDue(), false);
+  clock += 1999;
+  check('still nothing at 1999ms', t.promoteDue(), false);
+  check('still not running', t.snapshot({}).counts.running, 0);
+  clock += 2;
+  check('it promotes once the grace has elapsed', t.promoteDue(), true);
+  check('now it is running', t.snapshot({}).counts.running, 1);
+  check('and nothing is waiting', t.hasPending(), false);
+  check('promoting again is a no-op', t.promoteDue(), false);
+}
+
+{
+  /* a foreground call that settles inside the grace period never appears at all */
+  const clock = 1000;
+  const t = createTracker({ now: () => clock, graceMs: 2000 });
+  t.ingest({ type: 'registered', job: view('fg-fast') });
+  check('the fast call is never counted as running', t.snapshot({}).counts.running, 0);
+  t.ingest({ type: 'settled', cause: 'producer', awaited: true, job: view('fg-fast', { status: 'completed', finishedAt: 1100 }) });
+  check('it lands in history instead', t.snapshot({}).counts.settled, 1);
+  check('no pending entry is left behind', t.hasPending(), false);
+  check('and it never rang', t.snapshot({}).unseen, 0);
+}
+
+{
+  /* progress is the one thing the shell tool never reports, so it promotes at once */
+  let clock = 1000;
+  const t = createTracker({ now: () => clock, graceMs: 2000 });
+  t.ingest({ type: 'registered', job: view('bg-progress') });
+  check('held at first', t.snapshot({}).counts.running, 0);
+  check('progress promotes immediately', t.ingest({ type: 'progress', job: view('bg-progress', { progress: 'step 1' }) }), true);
+  check('visible now', t.snapshot({}).counts.running, 1);
+  check('and no longer pending', t.hasPending(), false);
+  check('the promoted row keeps its progress', t.snapshot({}).running[0].progress, 'step 1');
+  clock += 5000;
+  check('the promotion timer has nothing left to do', t.promoteDue(), false);
+}
+
+{
+  /* grace off: the pre-grace behaviour, kept for anyone who wants it */
+  const t = createTracker({ now: () => 1000, graceMs: 0 });
+  check('grace off promotes at once', t.ingest({ type: 'registered', job: view('eager') }), true);
+  check('and it is running immediately', t.snapshot({}).counts.running, 1);
+  check('nothing is ever pending', t.hasPending(), false);
+}
+
+{
+  /* a job that disappears while still pending must leave nothing behind */
+  const t = createTracker({ now: () => 1000, graceMs: 2000 });
+  t.ingest({ type: 'registered', job: view('gone') });
+  check('removing a pending job is a change', t.ingest({ type: 'removed', job: view('gone') }), true);
+  check('nothing pending', t.hasPending(), false);
+  check('nothing running', t.snapshot({}).counts.running, 0);
+  check('nothing listed', t.snapshot({}).counts.settled, 0);
+}
+
+{
+  /* seeding is never delayed: those jobs have already been alive for an unknown while */
+  const t = createTracker({ now: () => 1000, graceMs: 2000 });
+  t.seed([view('adopted')]);
+  check('a seeded job is running at once', t.snapshot({}).counts.running, 1);
+  check('and never waits', t.hasPending(), false);
+}
+
+{
   /* the same id settling twice is one row, not two */
-  const t = createTracker({ now: () => 0 });
+  const t = createTracker({ graceMs: 0, now: () => 0 });
   t.ingest({ type: 'settled', job: view('bash-5', { status: 'completed', finishedAt: 1 }) });
   t.ingest({ type: 'settled', job: view('bash-5', { status: 'failed', finishedAt: 2, detail: 'boom' }) });
   const s = t.snapshot({});
@@ -150,7 +228,7 @@ const view = (id, over) => Object.assign({
 {
   /* ageing and the row cap, driven by an injectable clock */
   let clock = 1_000_000;
-  const t = createTracker({ now: () => clock, keepMs: 60_000, maxRows: 3 });
+  const t = createTracker({ graceMs: 0, now: () => clock, keepMs: 60_000, maxRows: 3 });
   for (let i = 0; i < 5; i++) {
     t.ingest({ type: 'settled', job: view(`bash-${i}`, { status: 'completed', startedAt: clock - 500, finishedAt: clock }) });
   }
@@ -167,7 +245,7 @@ const view = (id, over) => Object.assign({
 
 {
   /* seeding: running adopted, finished adopted as history without lighting the badge */
-  const t = createTracker({ now: () => 7000 });
+  const t = createTracker({ graceMs: 0, now: () => 7000 });
   t.seed([
     view('bash-a'),
     view('bash-b', { status: 'completed', finishedAt: 6000, detail: 'exit 0' }),
@@ -182,7 +260,7 @@ const view = (id, over) => Object.assign({
 
 {
   /* malformed input must not throw: the feed is a Host boundary */
-  const t = createTracker({});
+  const t = createTracker({ graceMs: 0 });
   check('null event', t.ingest(null), false);
   check('event without a job', t.ingest({ type: 'registered' }), false);
   check('unknown event type', t.ingest({ type: 'whatever', job: view('x') }), false);
@@ -196,10 +274,10 @@ const view = (id, over) => Object.assign({
 
 {
   /* the ui block is passed through untouched: the page reads its settings from one frame */
-  const t = createTracker({});
+  const t = createTracker({ graceMs: 0 });
   const ui = { position: 'top-left', sound: 'never', volume: 0.1, pollMs: 2000 };
   check('ui passthrough', t.snapshot(ui).ui, ui);
-  check('ui defaults to an empty object', createTracker({}).snapshot().ui, {});
+  check('ui defaults to an empty object', createTracker({ graceMs: 0 }).snapshot().ui, {});
 }
 
 /* --------------------------------------------------------------- apply() */
@@ -260,7 +338,9 @@ function fakeRes() {
 
 {
   const host = fakeHost();
-  apply(host.service, { position: 'top-left', sound: 'hidden', volume: 0.2, keepMinutes: 5, maxRows: 7 });
+  /* graceMs 0 here: this block is about routes, frames and acks, so a registration has to count at
+   * once. The grace period has its own block further down. */
+  apply(host.service, { position: 'top-left', sound: 'hidden', volume: 0.2, keepMinutes: 5, maxRows: 7, graceMs: 0 });
 
   check('four routes registered', host.routes.length, 4);
   const paths = host.routes.map((r) => r.path).sort();
@@ -421,6 +501,54 @@ function fakeRes() {
   uiRoute.handler({}, res);
   ok('the ui route serves the badge source', res.body.includes('data-job-badge-state'));
   ok('the served source is not a stale copy', res.body.includes('__dshJobBadge'));
+}
+
+{
+  /*
+   * The promotion timer as the Host runs it: armed by a registration, alive only while something
+   * waits, disarmed the moment nothing does. A timer that ran forever would wake an idle Host four
+   * times a second for nothing.
+   */
+  const host = fakeHost();
+  apply(host.service, { graceMs: 60 });
+  const listener = host.listeners[0].listener;
+  const state = host.routes.find((r) => /state-\d+\.json$/.test(r.path));
+  const read = () => { const res = fakeRes(); state.handler({}, res); return JSON.parse(res.body); };
+  const fastTimer = () => host.timers.find((timer) => timer.ms < 1000);
+
+  check('an idle Host runs no fast timer', Boolean(fastTimer()), false);
+  listener({ type: 'registered', job: { id: 'held-1', kind: 'pwsh', label: 'a tool call', status: 'running', startedAt: Date.now() } });
+  check('a fresh registration is not counted as running', read().counts.running, 0);
+  ok('the registration armed a promotion timer', Boolean(fastTimer()));
+  await sleep(90);
+  fastTimer().callback();
+  check('after the grace it is counted', read().counts.running, 1);
+  check('and the timer disarmed itself', Boolean(fastTimer()), false);
+  check('the 20s heartbeat never stopped', host.timers.some((timer) => timer.ms === 20000), true);
+
+  /* a job that reports progress skips the wait entirely */
+  listener({ type: 'progress', job: { id: 'bg-9', kind: 'subagent', label: 'child', status: 'running', startedAt: Date.now(), progress: 'working' } });
+  check('progress is visible immediately', read().counts.running, 2);
+  check('progress needed no timer', Boolean(fastTimer()), false);
+}
+
+{
+  /* the timer only ever exists while something waits, so a listener that registers and settles a
+   * fast job leaves the Host with no fast timer at all */
+  const host = fakeHost();
+  apply(host.service, { graceMs: 60 });
+  const listener = host.listeners[0].listener;
+  listener({ type: 'registered', job: { id: 'quick', kind: 'pwsh', label: 'echo', status: 'running', startedAt: Date.now() } });
+  listener({ type: 'settled', cause: 'producer', awaited: true, job: { id: 'quick', kind: 'pwsh', label: 'echo', status: 'completed', startedAt: Date.now(), finishedAt: Date.now() } });
+  listener({ type: 'removed', job: { id: 'quick', kind: 'pwsh', label: 'echo', status: 'completed', startedAt: Date.now() } });
+  const state = host.routes.find((r) => /state-\d+\.json$/.test(r.path));
+  const res = fakeRes();
+  state.handler({}, res);
+  const snapshot = JSON.parse(res.body);
+  check('a tool call that came and went leaves nothing running', snapshot.counts.running, 0);
+  check('and nothing unread', snapshot.unseen, 0);
+  check('and nothing listed', snapshot.counts.settled, 0);
+  ok('and no fast timer was armed', host.timers.every((timer) => timer.ms === 20000));
 }
 
 console.log(`tracker-test: ${pass} assertions passed`);

@@ -44,6 +44,8 @@ node test/preview.mjs      # 打开它打印的 http://127.0.0.1:8799/
 
 判据是 `settled` 事件里的 **`awaited`**：前台 shell 工具自己 `registry.wait(id, …)` 等结果、收完再 `registry.remove(id)`，所以它的结算事件带 `awaited: true`；注册表发布这个字段的用途原文就写在文档里——"让完成播报者跳过已被等待方收走的结算"。**早先没看这个字段时，每一个工具调用结束都会"滴"一声**（前台结算 → 瞬时未读 → 页面响铃 → 紧跟着被 remove 掉），这是实测撞出来的 bug；现在两个方向都有测试钉住：`awaited: true` 不上报，`awaited: false` 或缺省照常上报。
 
+**"在跑"计数也不会被前台调用闪到了**，但用的是另一套办法——因为**注册时**注册表根本没有前台/后台标志：shell 工具的后台路径和"前台但可提升"路径调用的是同一个 `startJob`、同一份 spec（读源码确认）。所以新任务要先活过 `graceMs`（默认 2 秒）才计入"在跑"：工具调用活不到，真后台任务活得久。例外是**报过 progress 的任务立即放行**——shell 工具从不上报 progress，所以这条捷径不会把前台调用放回来。提升定时器只在真有任务在等的时候存在，空闲宿主不会被每几百毫秒叫醒一次。
+
 ## 2. 交互设计
 
 **图标状态**（`shell.overlay` 层里的固定胶囊，位置可配置）
@@ -74,7 +76,7 @@ dsh-job-badge/
   index.js            宿主半边：订阅全局 job 事件、维护计数、四条约路由、注入一行 loader
   notice.js           页面半边：纯 DOM + 轮询 + SSE，画出图标与面板（无构建步骤、无 JSX）
   cordis.patch.yml    bundle patch：把插件插进 profile
-  test/               tracker-test.mjs（宿主，117 条断言）、notice-render.mjs（真浏览器，50 条）
+  test/               tracker-test.mjs（宿主，159 条断言）、notice-render.mjs（真浏览器，50 条）
   test/verify-live.mjs 装好之后的健康检查（安装副本是否最新 + 路由是否在跑）
 ```
 
@@ -120,6 +122,7 @@ ctx.jobs.events.subscribe({owners:'all'})     ← 进程内所有 job 的生命�
     volume: 0.35             # 0 .. 1
     keepMinutes: 30          # 已结束任务在列表里留多久
     maxRows: 40              # 已结束行的硬上限
+    graceMs: 2000            # 新任务要先活这么久才算在跑（0 = 立刻）
     stream: true             # false = 关掉 SSE，只留轮询
 ```
 
@@ -156,7 +159,7 @@ node test/verify-live.mjs
 ## 6. 验证
 
 ```powershell
-node test/tracker-test.mjs     # 宿主半边：117 条断言（纯逻辑 + 假 Host 的路由/订阅/注入/清理）
+node test/tracker-test.mjs     # 宿主半边：159 条断言（纯逻辑 + 假 Host 的路由/订阅/注入/清理）
 node test/notice-render.mjs    # 真浏览器（无头 Edge + CDP）：50 条断言
 node test/verify-live.mjs      # 对着正在跑的宿主：安装副本是否最新、四条路由是否在服务
 ```

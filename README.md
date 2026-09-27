@@ -18,6 +18,7 @@ Why it exists: DSH runs background work (a `run_in_background` shell call, a bac
 - **Clicking is looking**: the panel opens and the unread count clears. The count lives in the Host, so two open windows cannot disagree about it.
 - **Minimized**: the in-page chip is invisible by definition, so a completion also plays the chime and sets the taskbar badge (`navigator.setAppBadge`).
 - **Foreground commands never light it.** A foreground shell call waits on its own job (`registry.wait(id, …)`) and removes the record right after, so its settlement arrives with `awaited: true` and its result is surfacing in the conversation at that moment. The registry publishes that flag for exactly this purpose — *"so a completion reporter can skip settlements a waiting caller already collected"* — and honouring it is what stopped **every tool call from chiming once**. A background job has no waiter, arrives with `awaited: false`, and does light the badge. Tested in both directions.
+- **Foreground commands do not flicker the count either**, by a different mechanism, because the registry carries no such flag at registration: the shell tool's background path and its foreground-with-promotion path call the *same* `startJob` with the *same* spec. So a new job spends `graceMs` (2s) waiting before it counts as running — a tool call is over before that, real background work is not — and a job that reports progress is promoted at once, since the shell tool never reports progress. The promotion timer exists only while something waits.
 
 ## How it works
 
@@ -74,6 +75,7 @@ node test/verify-live.mjs      # compares the two copies, and says which generat
     volume: 0.35             # 0 .. 1
     keepMinutes: 30          # how long a finished job stays listed
     maxRows: 40              # hard cap on finished rows
+    graceMs: 2000            # a new job must live this long to count as running (0 = at once)
     stream: true             # false leaves plain polling
 ```
 
@@ -84,7 +86,7 @@ Config changes hot-apply: the Host re-applies the entry and the page picks up th
 ## Verify
 
 ```powershell
-node test/tracker-test.mjs     # Host half: 117 assertions (pure tracker + routes/subscription/
+node test/tracker-test.mjs     # Host half: 159 assertions (pure tracker + routes/subscription/
                                # injection/cleanup against a fake Host)
 node test/notice-render.mjs    # real browser (headless Edge + CDP): 50 assertions over the live DOM
 node test/verify-live.mjs      # against the running Host: copies in sync? which generation answers?

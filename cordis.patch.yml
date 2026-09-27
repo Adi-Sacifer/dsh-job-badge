@@ -14,6 +14,12 @@
 #   volume       0 .. 1 (default 0.35)
 #   keepMinutes  how long a finished job stays listed (default 30)
 #   maxRows      hard cap on finished rows kept (default 40)
+#   graceMs      how long a newly registered job waits before it counts as running (default 2000).
+#                The registry carries no foreground/background flag at registration - the shell
+#                tool's background path and its foreground-with-promotion path call the very same
+#                startJob with the same spec - so this wait is what keeps a tool call (over in a
+#                moment) out of the badge. A job that reports progress is promoted at once, because
+#                the shell tool never reports progress. 0 promotes immediately.
 #   stream       false turns the push channel off and leaves plain polling (default true)
 - insert:
     - id: job-badge
@@ -25,4 +31,5 @@
         volume: 0.35
         keepMinutes: 30
         maxRows: 40
+        graceMs: 2000
         stream: true

@@ -71,15 +71,28 @@ function finite(value, fallback) {
  *
  * @param options.keepMs   how long a finished row stays listed
  * @param options.maxRows  hard cap on finished rows
+ * @param options.graceMs  how long a newly registered job waits before it counts as running
  * @param options.now      clock, injectable for tests
  */
 export function createTracker(options = {}) {
   const keepMs = Math.max(0, finite(options.keepMs, 30 * 60 * 1000));
   const maxRows = Math.max(1, Math.floor(finite(options.maxRows, 40)));
+  const graceMs = Math.max(0, finite(options.graceMs, 2000));
   const now = typeof options.now === 'function' ? options.now : () => Date.now();
 
   /** id -> row, for jobs that are running or stopping. */
   const live = new Map();
+  /**
+   * id -> { row, at }: registered, not yet counted as running.
+   *
+   * WHY A GRACE PERIOD EXISTS AT ALL: the registry publishes no foreground/background flag at
+   * registration - the shell tool's background path and its foreground-with-promotion path call the
+   * very same `startJob` with the same spec - so a foreground command that finishes in a second and
+   * a background job that will run for ten minutes look identical at birth. Waiting briefly is what
+   * separates them: a tool call is over before the grace elapses, real background work is not. A
+   * job that reports progress is promoted at once, because the shell tool never reports progress.
+   */
+  const pending = new Map();
   /** Settled rows, newest first. */
   const done = [];
   /** Settled ids the human has not looked at yet. */
@@ -136,6 +149,7 @@ export function createTracker(options = {}) {
     if (at >= 0) done.splice(at, 1);
     done.unshift(row);
     live.delete(row.id);
+    pending.delete(row.id);
     /*
      * WHO IS THIS NEWS FOR?
      *
@@ -169,10 +183,43 @@ export function createTracker(options = {}) {
 
       if (type === 'settled') return settle(view, event.cause, event.awaited === true);
 
-      if (type === 'registered' || type === 'progress' || type === 'stopping') {
+      if (type === 'registered') {
         /* defensive: a lifecycle event that already carries a terminal status is a settlement */
         if (TERMINAL.has(view.status)) return settle(view, undefined);
         const row = project(view);
+        if (graceMs === 0) {
+          if (sameLive(live.get(id), row)) return false;
+          live.set(id, row);
+          revision++;
+          return true;
+        }
+        if (live.has(id)) {
+          if (sameLive(live.get(id), row)) return false;
+          live.set(id, row);
+          revision++;
+          return true;
+        }
+        const held = pending.get(id);
+        /* a job waiting out its grace period is not in the snapshot yet, so this is not a visible
+         * change: it arms the promotion timer and nothing else */
+        if (held && sameLive(held.row, row)) return false;
+        pending.set(id, { row, at: held ? held.at : now() });
+        return false;
+      }
+
+      if (type === 'progress' || type === 'stopping') {
+        if (TERMINAL.has(view.status)) return settle(view, undefined);
+        const row = project(view);
+        /*
+         * A producer that reports progress is real running work - the shell tool never does, so a
+         * foreground command cannot sneak back in this way - and it is promoted at once rather than
+         * waiting out the grace period.
+         */
+        if (pending.delete(id)) {
+          live.set(id, row);
+          revision++;
+          return true;
+        }
         if (sameLive(live.get(id), row)) return false;
         live.set(id, row);
         revision++;
@@ -181,10 +228,11 @@ export function createTracker(options = {}) {
 
       if (type === 'removed') {
         const wasLive = live.delete(id);
+        const wasPending = pending.delete(id);
         const at = done.findIndex((r) => r.id === id);
         if (at >= 0) done.splice(at, 1);
         const wasUnseen = unseen.delete(id);
-        if (!wasLive && at < 0 && !wasUnseen) return false;
+        if (!wasLive && !wasPending && at < 0 && !wasUnseen) return false;
         revision++;
         return true;
       }
@@ -192,10 +240,36 @@ export function createTracker(options = {}) {
       return false;
     },
 
+    /** Is anything still waiting out its grace period? Drives the promotion timer. */
+    hasPending() {
+      return pending.size > 0;
+    },
+
+    /**
+     * Promote whatever has been registered longer than the grace period. The caller runs this on a
+     * short timer, and broadcasts when it reports a change.
+     */
+    promoteDue() {
+      if (pending.size === 0) return false;
+      const cutoff = now() - graceMs;
+      let changed = false;
+      for (const entry of [...pending]) {
+        const [id, held] = entry;
+        if (held.at > cutoff) continue;
+        pending.delete(id);
+        live.set(id, held.row);
+        changed = true;
+      }
+      if (changed) revision++;
+      return changed;
+    },
+
     /**
      * Adopt jobs that were already in the registry when this plugin mounted (a live Host reload).
-     * Running ones join the roster. Finished ones are history WITHOUT lighting the badge: the
-     * human was never watching this collector, so it cannot claim they missed something.
+     * Running ones join the roster straight away: they have already been alive for an unknown but
+     * non-trivial time, so there is no grace period left to serve. Finished ones are history WITHOUT
+     * lighting the badge: the human was never watching this collector, so it cannot claim they
+     * missed something.
      */
     seed(views) {
       let changed = false;
@@ -287,6 +361,12 @@ export function apply(ctx, config) {
      * system notifications are known to work; 'hidden' fires it when the window is not visible.
      */
     notify: enumerable(config?.notify, ['always', 'hidden', 'never'], 'never'),
+    /*
+     * How long a newly registered job waits before it counts as running. This is the one lever that
+     * separates a tool call (over in a moment) from real background work, because the registry
+     * publishes no such flag at registration. 0 promotes immediately.
+     */
+    graceMs: clamp(config?.graceMs, 0, 60000, 2000),
     volume: clamp(config?.volume, 0, 1, 0.35),
     stream: config?.stream !== false,
   };
@@ -304,11 +384,24 @@ export function apply(ctx, config) {
     pollMs: 2500,
   };
 
-  const tracker = createTracker({ keepMs: settings.keepMs, maxRows: settings.maxRows });
+  const tracker = createTracker({ keepMs: settings.keepMs, maxRows: settings.maxRows, graceMs: settings.graceMs });
   const clients = new Set();
   const disposers = [];
 
+  /*
+   * The promotion timer exists only while something is waiting out its grace period: it is armed by
+   * a registration and disarms itself once nothing is pending, so an idle Host is not woken every
+   * few hundred milliseconds for nothing.
+   */
+  let promoteTimer = null;
+  const stopPromote = () => {
+    if (promoteTimer === null) return;
+    try { promoteTimer(); } catch { /* already gone */ }
+    promoteTimer = null;
+  };
+
   const cleanup = () => {
+    stopPromote();
     for (const dispose of disposers.splice(0).reverse()) {
       try { dispose(); } catch { /* a failed teardown must not stop the rest */ }
     }
@@ -333,20 +426,35 @@ export function apply(ctx, config) {
 
     const onChange = () => { try { broadcast(); } catch { /* never break the Host from a listener */ } };
 
+    /* The invariant is exact: the promotion timer exists if and only if something is waiting. */
+    const armPromote = () => {
+      if (!tracker.hasPending()) { stopPromote(); return; }
+      if (promoteTimer !== null) return;
+      const tick = Math.max(50, Math.min(400, Math.floor(settings.graceMs / 4)));
+      promoteTimer = ctx.interval(() => {
+        try {
+          if (tracker.promoteDue()) onChange();
+          if (!tracker.hasPending()) stopPromote();
+        } catch { /* a timer must never break the Host */ }
+      }, tick);
+    };
+
     /*
      * The global feed. `owners: 'all'` is the whole point - a badge that only saw the session in
      * front of you would be blind to the job you walked away from.
      */
     let unsubscribe = null;
+    const ingest = (event) => {
+      try {
+        if (tracker.ingest(event)) onChange();
+        armPromote();
+      } catch { /* never break the Host from a listener */ }
+    };
     try {
-      unsubscribe = ctx.jobs.events.subscribe({ owners: 'all' }, (event) => {
-        try { if (tracker.ingest(event)) onChange(); } catch { /* ditto */ }
-      });
+      unsubscribe = ctx.jobs.events.subscribe({ owners: 'all' }, ingest);
     } catch (error) {
       ctx.logger?.warn?.(`job-badge: owners:'all' subscription refused, falling back to scope: ${error?.message ?? error}`);
-      unsubscribe = ctx.jobs.events.subscribe({ owners: 'scope' }, (event) => {
-        try { if (tracker.ingest(event)) onChange(); } catch { /* ditto */ }
-      });
+      unsubscribe = ctx.jobs.events.subscribe({ owners: 'scope' }, ingest);
     }
     disposers.push(unsubscribe);
 
