@@ -1,0 +1,26 @@
+{
+  "name": "@local/dsh-job-badge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Background-task badge for the DeepSeek Harness GUI: counts running jobs, marks completions unread, chimes, and opens a task panel on click.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Adi-Sacifer/dsh-job-badge.git"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "jobs",
+    "notification"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./notice": "./notice.js"
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" }
+  }
+}

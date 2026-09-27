@@ -1,0 +1,28 @@
+# Bundle patch for dsh-job-badge.
+#
+# Inserted, not patched: this id does not exist in any lower bundle layer.
+#
+# Config (all optional; the defaults below are the defaults in code):
+#   position     bottom-right | bottom-left | top-right | top-left  (default bottom-right)
+#   sound        always | hidden | never   (default always: chime on every new completion,
+#                "hidden" only while the page is not visible, "never" never)
+#   notify       always | hidden | never   (default never: an OS banner for a completion. Off by
+#                default because a machine with system notifications switched off
+#                (`PushNotifications\ToastEnabled = 0`) never shows one - from this page or from
+#                PowerShell either - so the badge, the taskbar number and the chime are what
+#                actually reach you. "hidden" fires it only when the window is not visible.)
+#   volume       0 .. 1 (default 0.35)
+#   keepMinutes  how long a finished job stays listed (default 30)
+#   maxRows      hard cap on finished rows kept (default 40)
+#   stream       false turns the push channel off and leaves plain polling (default true)
+- insert:
+    - id: job-badge
+      name: '@local/dsh-job-badge'
+      config:
+        position: bottom-right
+        sound: always
+        notify: never
+        volume: 0.35
+        keepMinutes: 30
+        maxRows: 40
+        stream: true
