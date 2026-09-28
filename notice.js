@@ -513,7 +513,10 @@
       if (!Ctor) return false;
       if (!audio) audio = new Ctor();
       if (audio.state === 'suspended' && typeof audio.resume === 'function') audio.resume().catch(function () {});
-      var notes = kind === 'bad' ? [[660, 0], [440, 0.15]] : [[880, 0], [1318.51, 0.13]];
+      var notes = kind === 'bad' ? [[660, 0], [440, 0.15]]
+        : kind === 'answer' ? [[988, 0], [1318.51, 0.12], [1760, 0.24]]   // someone needs YOUR answer
+          : kind === 'asking' ? [[784, 0], [588, 0.14]]                  // the page you are in is asking
+            : [[880, 0], [1318.51, 0.13]];
       var t0 = audio.currentTime;
       for (var i = 0; i < notes.length; i++) {
         var osc = audio.createOscillator();
@@ -715,11 +718,100 @@
     source.onerror = function () { if (source.readyState === 2) { try { source.close(); } catch (e) { /* ignore */ } } };
   }
 
+  /* ------------------------------------------------------- someone needs an answer */
+
+  /*
+   * CHIME WHEN A CONVERSATION IS WAITING FOR A PERSON.
+   *
+   * Two cases the user asked for, and they are audibly different on purpose:
+   *
+   *   another conversation is waiting for an answer   -> 'answer', rising three notes
+   *   the conversation THIS page is showing is asking  -> 'asking', a lower two notes
+   *
+   * The second is quieter information: the question is already on screen in front of you, so a loud
+   * chime would be noise. The first is the one that actually needs reaching - the question is in
+   * another window you are not looking at, and nothing else in the UI says so.
+   *
+   * WHERE THE DATA COMES FROM
+   *   session-watch already computes this state (`waiting-for-human`, see awaiting-human-test.mjs
+   *   there) and serves it on a route stamped with its own load mtime. That stamp is exactly why the
+   *   URL cannot be hardcoded: it changes on every plugin install. session-watch publishes it on the
+   *   script tag it injects, so that tag is the handle - one element lookup, no new route on either
+   *   side, and nothing to keep in sync by hand.
+   *
+   *   The tag may not exist for the first seconds after a page load (whichever plugin injects first
+   *   wins the race), so discovery retries rather than giving up: a feature that silently does nothing
+   *   when the plugin happened to load late is worse than no feature.
+   *
+   * NO CHIME FOR OLD NEWS: the first snapshot only primes the set. A question that was already
+   * waiting before this page loaded has already been seen; sounding for it is the false alarm that
+   * makes a chime worthless.
+   */
+  var SW_TAG_ID = 'session-watch-notice-loader';
+  var SW_ATTR = 'data-session-watch-state';
+  var WAIT_POLL_MS = 5000;
+  var swWaiting = {};    /* session id -> true, currently waiting for a human */
+  var swChimed = {};     /* session id -> true, already chimed for this wait */
+  var swPrimed = false;
+  var swReading = false;
+
+  function swUrl() {
+    var tag = document.getElementById(SW_TAG_ID);
+    var url = tag && tag.getAttribute(SW_ATTR);
+    return url || null;
+  }
+
+  function readWaiting() {
+    var url = swUrl();
+    if (!url || swReading) return;
+    swReading = true;
+    fetch(url, { signal: AbortSignal.timeout(10000), headers: { accept: 'application/json' } })
+      .then(function (res) { return res.ok ? res.json() : null; })
+      .then(function (sw) {
+        swReading = false;
+        if (!sw || !sw.available || !sw.sessions) return;
+        var want = {};
+        for (var i = 0; i < sw.sessions.length; i++) {
+          if (sw.sessions[i].state === 'waiting-for-human') want[sw.sessions[i].id] = true;
+        }
+        if (!swPrimed) {
+          /* first look: adopt what is already true, chime for none of it */
+          swWaiting = want;
+          for (var id in want) swChimed[id] = true;
+          swPrimed = true;
+          return;
+        }
+        var mine = false;
+        for (var id2 in want) {
+          if (swWaiting[id2] || swChimed[id2]) continue;
+          swChimed[id2] = true;
+          if (sw.selfSessionId && id2 === sw.selfSessionId) mine = true;
+        }
+        swWaiting = want;
+        if (mine) chime('asking');                            /* the page in front of you is asking */
+        else if (Object.keys(want).length) chime('answer');   /* somewhere else needs you */
+      }, function () { swReading = false; })
+      .then(function () { swReading = false; }, function () { swReading = false; });
+  }
+
+  function startWaitingWatch() {
+    var tries = 0;
+    var finder = window.setInterval(function () {
+      tries++;
+      if (swUrl() || tries > 40) {
+        clearInterval(finder);
+        readWaiting();
+        window.setInterval(readWaiting, WAIT_POLL_MS);
+      }
+    }, 500);
+  }
+
   function start() {
     if (window.__dshJobBadge) return;   /* one badge per page, even if the tag is injected twice */
     window.__dshJobBadge = true;
     read();
     connect();
+    startWaitingWatch();
     document.addEventListener('visibilitychange', function () {
       if (!document.hidden) read();
     });
